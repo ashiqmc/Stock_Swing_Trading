@@ -1,0 +1,418 @@
+import streamlit as st
+import yfinance as yf
+import ta
+import pandas as pd
+import numpy as np
+import requests
+import json
+from datetime import datetime
+
+st.title("📊 Swing Trading AI Dashboard")
+
+# Function to search for stocks
+def search_stocks(query):
+    try:
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.get(url, headers=headers)
+        data = json.loads(response.text)
+        
+        if 'quotes' not in data or not data['quotes']:
+            return []
+        
+        results = []
+        for quote in data['quotes']:
+            if 'symbol' in quote and 'shortname' in quote:
+                results.append({
+                    'symbol': quote['symbol'],
+                    'name': quote['shortname'],
+                    'exchange': quote.get('exchange', 'Unknown')
+                })
+        return results
+    except Exception as e:
+        st.error(f"Error searching for stocks: {e}")
+        return []
+
+# Sidebar for settings and stock selection
+st.sidebar.header("⚙️ Settings")
+
+# Default stocks list
+default_stocks = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS","BLUESTARCO.BO","UJJIVANSFB.NS","TATAMOTORS.NS"]
+
+# Initialize session state for tracking selected stocks
+if 'selected_stocks' not in st.session_state:
+    st.session_state.selected_stocks = default_stocks.copy()
+
+# Stock search section
+st.sidebar.subheader("🔍 Search & Add Stocks")
+search_query = st.sidebar.text_input("Search for stocks", "")
+search_button = st.sidebar.button("Search")
+
+if search_button and search_query:
+    search_results = search_stocks(search_query)
+    if search_results:
+        st.sidebar.write(f"Found {len(search_results)} results:")
+        for i, stock in enumerate(search_results[:10]):  # Limit to 10 results
+            col1, col2 = st.sidebar.columns([1, 3])
+            with col1:
+                if st.button(f"Add", key=f"add_{i}"):
+                    symbol = stock['symbol']
+                    if symbol not in st.session_state.selected_stocks:
+                        st.session_state.selected_stocks.append(symbol)
+                        st.sidebar.success(f"Added {symbol}")
+                    else:
+                        st.sidebar.info(f"{symbol} already in your list")
+            with col2:
+                st.write(f"{stock['symbol']}: {stock['name']} ({stock['exchange']})")
+    else:
+        st.sidebar.warning("No stocks found for your query")
+
+# Display and manage selected stocks
+st.sidebar.subheader("📋 Your Stock List")
+if not st.session_state.selected_stocks:
+    st.sidebar.warning("⚠️ No stocks selected")
+else:
+    for i, stock in enumerate(st.session_state.selected_stocks):
+        col1, col2 = st.sidebar.columns([3, 1])
+        with col1:
+            st.write(f"{i+1}. {stock}")
+        with col2:
+            if st.button("Remove", key=f"remove_{i}"):
+                st.session_state.selected_stocks.remove(stock)
+                st.experimental_rerun()
+
+# Function to fetch stock data safely
+def fetch_stock_data(stock):
+    try:
+        data = yf.download(stock, period="6mo", interval="1d")
+        if data.empty:
+            st.error(f"❌ No data found for {stock}. Please try another stock.")
+            return None
+        return data
+    except Exception as e:
+        st.error(f"❌ Error fetching data for {stock}: {e}")
+        return None
+
+# Function to calculate indicators and generate buy/sell signals
+@st.cache_data
+def get_signal(ticker):
+    # Fetch data
+    df = fetch_stock_data(ticker)
+    
+    if df is None:
+        return None
+    
+    # Check for MultiIndex columns and flatten if needed
+    if isinstance(df.columns, pd.MultiIndex):
+        # Get the first level of column names
+        col_names = [col[0] for col in df.columns]
+        # Create a new DataFrame with flattened column names
+        data = pd.DataFrame()
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if (col, ticker) in df.columns:
+                data[col] = df[(col, ticker)].values
+    else:
+        data = df.copy()
+    
+    # Make sure we have enough data points
+    if len(data) < 50:
+        st.error(f"Not enough data points for {ticker}")
+        return None
+    
+    # Check required columns
+    required_cols = ['Close', 'Volume']
+    missing_cols = [col for col in required_cols if col not in data.columns]
+    if missing_cols:
+        st.error(f"Missing columns in {ticker} data: {missing_cols}")
+        return None
+    
+    # Calculate indicators
+    try:
+        # Calculate technical indicators
+        data["SMA_50"] = ta.trend.sma_indicator(data["Close"], window=50)
+        data["SMA_200"] = ta.trend.sma_indicator(data["Close"], window=200)
+        data["RSI"] = ta.momentum.rsi(data["Close"], window=14)
+        data["MACD"] = ta.trend.macd(data["Close"])
+        data["MACD_Signal"] = ta.trend.macd_signal(data["Close"])
+        data["Upper_BB"] = ta.volatility.bollinger_hband(data["Close"])
+        data["Lower_BB"] = ta.volatility.bollinger_lband(data["Close"])
+        data["Volume_Change"] = data["Volume"].pct_change()
+        
+        # Fill any missing values
+        data.fillna(method="bfill", inplace=True)
+    except Exception as e:
+        st.error(f"Error calculating indicators for {ticker}: {str(e)}")
+        return None
+    
+    # Get last row for signal generation
+    last_row = data.iloc[-1]
+    
+    # Generate signal
+    try:
+        # Buy score system (count how many buy conditions are met)
+        buy_score = 0
+        
+        if last_row["RSI"] < 40:  # Less strict RSI threshold
+            buy_score += 1
+        if last_row["SMA_50"] > last_row["SMA_200"]:  # Golden cross
+            buy_score += 1
+        if last_row["MACD"] > last_row["MACD_Signal"]:  # MACD crossover
+            buy_score += 1
+        if last_row["Close"] <= last_row["Lower_BB"]:  # Price at lower Bollinger Band
+            buy_score += 1
+        if last_row["Volume_Change"] > 0:  # Increasing volume
+            buy_score += 1
+            
+        # Sell score system (count how many sell conditions are met)
+        sell_score = 0
+        
+        if last_row["RSI"] > 60:  # Less strict RSI threshold
+            sell_score += 1
+        if last_row["SMA_50"] < last_row["SMA_200"]:  # Death cross
+            sell_score += 1
+        if last_row["MACD"] < last_row["MACD_Signal"]:  # MACD crossover bearish
+            sell_score += 1
+        if last_row["Close"] >= last_row["Upper_BB"]:  # Price at upper Bollinger Band
+            sell_score += 1
+        if last_row["Volume_Change"] < 0:  # Decreasing volume
+            sell_score += 1
+            
+        # Decision making based on scores
+        if buy_score >= 3 and buy_score > sell_score:
+            return "BUY", data, {"buy_score": buy_score, "sell_score": sell_score}
+        elif sell_score >= 3 and sell_score > buy_score:
+            return "SELL", data, {"buy_score": buy_score, "sell_score": sell_score}
+        else:
+            return "HOLD", data, {"buy_score": buy_score, "sell_score": sell_score}
+    except Exception as e:
+        st.error(f"Error generating signal for {ticker}: {str(e)}")
+        return None
+
+# Main area for results
+if not st.session_state.selected_stocks:
+    st.warning("⚠️ Please select at least one stock from the sidebar.")
+else:
+    # UI to show results
+    if st.button("🔄 Refresh Data"):
+        results = []
+        detailed_results = {}
+        
+        with st.spinner("Fetching and analyzing stock data... ⏳"):
+            for stock in st.session_state.selected_stocks:
+                signal_result = get_signal(stock)
+                
+                if signal_result:
+                    signal, data, scores = signal_result
+                    results.append([stock, signal, scores["buy_score"], scores["sell_score"]])
+                    detailed_results[stock] = data
+            
+            # Display results table
+            if results:
+                df = pd.DataFrame(results, columns=["Stock", "Signal", "Buy Score", "Sell Score"])
+                
+                # Add styling based on signal
+                def highlight_signal(val):
+                    if val == 'BUY':
+                        return 'background-color: #8AFF8A'  # Light green
+                    elif val == 'SELL':
+                        return 'background-color: #FF8A8A'  # Light red
+                    else:
+                        return 'background-color: #FFFF8A'  # Light yellow
+                
+                styled_df = df.style.applymap(highlight_signal, subset=['Signal'])
+                
+                # Add timestamp to the success message
+                current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.success(f"✅ Signals updated successfully! (Last updated: {current_date})")
+                st.dataframe(styled_df)
+                
+                # Add a section to display detailed analysis with date
+                current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.subheader(f"📈 Detailed Analysis (as of {current_date})")
+                
+                for stock, signal_info, buy_score, sell_score in results:
+                    with st.expander(f"{stock} - {signal_info} (Buy: {buy_score}/5, Sell: {sell_score}/5)"):
+                        if stock in detailed_results:
+                            data = detailed_results[stock]
+                            
+                            # Create two columns
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                # Show the last 5 days of price data with dates
+                                st.write("#### Last 5 Trading Days")
+                                # Get the index which should contain dates
+                                last_5_days = data.tail(5).copy()
+                                
+                                # Create an extended dataframe for more history (last 30 days)
+                                last_30_days = data.tail(30).copy()
+                                
+                                # Convert the index to a column if it contains dates
+                                if isinstance(last_5_days.index, pd.DatetimeIndex):
+                                    # Process the last 5 days for the table
+                                    last_5_days = last_5_days.reset_index()
+                                    last_5_days.rename(columns={'index': 'Date'}, inplace=True)
+                                    # Format the date column
+                                    last_5_days['Date'] = last_5_days['Date'].dt.strftime('%Y-%m-%d')
+                                    # Reorder columns to show Date first
+                                    date_display = last_5_days[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+                                    
+                                    # Create a calendar view with the last 30 days
+                                    last_30_days = last_30_days.reset_index()
+                                    
+                                    # Process calendar data
+                                    calendar_data = last_30_days.copy()
+                                    calendar_data['Day'] = calendar_data['Date'].dt.day
+                                    calendar_data['Month'] = calendar_data['Date'].dt.month
+                                    calendar_data['Year'] = calendar_data['Date'].dt.year
+                                    calendar_data['DayOfWeek'] = calendar_data['Date'].dt.dayofweek
+                                    calendar_data['DateStr'] = calendar_data['Date'].dt.strftime('%Y-%m-%d')
+                                    
+                                    # Calculate daily returns for color coding
+                                    calendar_data['Return'] = calendar_data['Close'].pct_change() * 100
+                                    
+                                    # Create tabs for different views
+                                    tab1, tab2 = st.tabs(["Table View", "Calendar View"])
+                                    
+                                    with tab1:
+                                        st.dataframe(date_display, height=200)
+                                    
+                                    with tab2:
+                                        # Create a large calendar view
+                                        st.write("#### Calendar View (Last 30 Trading Days)")
+                                        
+                                        # Get unique months in the data
+                                        months = calendar_data[['Year', 'Month']].drop_duplicates().sort_values(['Year', 'Month'])
+                                        
+                                        for _, month_row in months.iterrows():
+                                            year = month_row['Year']
+                                            month = month_row['Month']
+                                            month_name = pd.Timestamp(year=year, month=month, day=1).strftime('%B %Y')
+                                            
+                                            st.write(f"**{month_name}**")
+                                            
+                                            # Filter data for this month
+                                            month_data = calendar_data[(calendar_data['Year'] == year) & 
+                                                                    (calendar_data['Month'] == month)]
+                                            
+                                            # Create a calendar grid
+                                            # First, create a list of day names for the header
+                                            days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+                                            
+                                            # Start with an empty calendar
+                                            calendar_html = '<div style="display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; width: 100%;">'
+                                            
+                                            # Add day headers
+                                            for day in days:
+                                                calendar_html += f'<div style="text-align: center; font-weight: bold; padding: 5px;">{day}</div>'
+                                            
+                                            # Get the first day of the month
+                                            first_day = pd.Timestamp(year=year, month=month, day=1)
+                                            # Get the day of week (0 = Monday, 6 = Sunday)
+                                            first_weekday = first_day.dayofweek
+                                            
+                                            # Add empty cells for days before the first day of the month
+                                            for _ in range(first_weekday):
+                                                calendar_html += '<div style="padding: 5px;"></div>'
+                                            
+                                            # Get the number of days in the month
+                                            if month == 12:
+                                                last_day = pd.Timestamp(year=year+1, month=1, day=1) - pd.Timedelta(days=1)
+                                            else:
+                                                last_day = pd.Timestamp(year=year, month=month+1, day=1) - pd.Timedelta(days=1)
+                                            
+                                            num_days = last_day.day
+                                            
+                                            # Add cells for each day of the month
+                                            for day in range(1, num_days + 1):
+                                                date_str = f"{year}-{month:02d}-{day:02d}"
+                                                
+                                                # Check if this day is in our trading data
+                                                day_data = month_data[month_data['Day'] == day]
+                                                
+                                                if len(day_data) > 0:
+                                                    # This is a trading day, get the data
+                                                    close_price = day_data['Close'].values[0]
+                                                    ret = day_data['Return'].values[0]
+                                                    
+                                                    # Determine color based on return
+                                                    if np.isnan(ret):
+                                                        bg_color = "#FFFFFF"  # White for no return data
+                                                    elif ret > 1:
+                                                        bg_color = "#00AA00"  # Strong green for >1% gain
+                                                    elif ret > 0:
+                                                        bg_color = "#88CC88"  # Light green for 0-1% gain
+                                                    elif ret < -1:
+                                                        bg_color = "#AA0000"  # Strong red for >1% loss
+                                                    elif ret < 0:
+                                                        bg_color = "#CC8888"  # Light red for 0-1% loss
+                                                    else:
+                                                        bg_color = "#CCCCCC"  # Gray for no change
+                                                    
+                                                    # Create cell with trading data
+                                                    calendar_html += f'''
+                                                    <div style="background-color: {bg_color}; color: white; padding: 5px; border-radius: 5px; text-align: center;">
+                                                        <div style="font-weight: bold;">{day}</div>
+                                                        <div style="font-size: 0.8em;">{close_price:.2f}</div>
+                                                        <div style="font-size: 0.7em;">{ret:.2f}%</div>
+                                                    </div>
+                                                    '''
+                                                else:
+                                                    # Not a trading day, just show the date
+                                                    calendar_html += f'''
+                                                    <div style="background-color: #F0F0F0; padding: 5px; border-radius: 5px; text-align: center;">
+                                                        <div>{day}</div>
+                                                    </div>
+                                                    '''
+                                            
+                                            # Close the calendar grid
+                                            calendar_html += '</div>'
+                                            
+                                            # Display the calendar
+                                            st.markdown(calendar_html, unsafe_allow_html=True)
+                                            
+                                            # Add a legend
+                                            legend_html = '''
+                                            <div style="display: flex; gap: 10px; margin-top: 10px; margin-bottom: 20px;">
+                                                <div style="display: flex; align-items: center;">
+                                                    <div style="width: 15px; height: 15px; background-color: #00AA00; margin-right: 5px;"></div>
+                                                    <span>Gain >1%</span>
+                                                </div>
+                                                <div style="display: flex; align-items: center;">
+                                                    <div style="width: 15px; height: 15px; background-color: #88CC88; margin-right: 5px;"></div>
+                                                    <span>Gain 0-1%</span>
+                                                </div>
+                                                <div style="display: flex; align-items: center;">
+                                                    <div style="width: 15px; height: 15px; background-color: #CC8888; margin-right: 5px;"></div>
+                                                    <span>Loss 0-1%</span>
+                                                </div>
+                                                <div style="display: flex; align-items: center;">
+                                                    <div style="width: 15px; height: 15px; background-color: #AA0000; margin-right: 5px;"></div>
+                                                    <span>Loss >1%</span>
+                                                </div>
+                                            </div>
+                                            '''
+                                            st.markdown(legend_html, unsafe_allow_html=True)
+                                else:
+                                    st.dataframe(last_5_days[['Open', 'High', 'Low', 'Close', 'Volume']])
+                            
+                            with col2:
+                                # Show key indicators
+                                st.write("#### Key Indicators")
+                                latest = data.iloc[-1]
+                                metrics = [
+                                    {"name": "RSI (14)", "value": f"{latest['RSI']:.2f}", "condition": latest['RSI'] < 40, "buy_text": "Oversold (Buy)", "sell_text": "Overbought (Sell)"},
+                                    {"name": "SMA 50 vs 200", "value": f"{latest['SMA_50']:.2f} vs {latest['SMA_200']:.2f}", "condition": latest['SMA_50'] > latest['SMA_200'], "buy_text": "Golden Cross (Buy)", "sell_text": "Death Cross (Sell)"},
+                                    {"name": "MACD vs Signal", "value": f"{latest['MACD']:.2f} vs {latest['MACD_Signal']:.2f}", "condition": latest['MACD'] > latest['MACD_Signal'], "buy_text": "Bullish Crossover (Buy)", "sell_text": "Bearish Crossover (Sell)"},
+                                    {"name": "Bollinger Bands", "value": f"{latest['Close']:.2f} (Price)", "condition": latest['Close'] <= latest['Lower_BB'], "buy_text": "At Lower Band (Buy)", "sell_text": "At Upper Band (Sell)"},
+                                    {"name": "Volume Change", "value": f"{latest['Volume_Change']*100:.2f}%", "condition": latest['Volume_Change'] > 0, "buy_text": "Increasing (Buy)", "sell_text": "Decreasing (Sell)"}
+                                ]
+                                
+                                for metric in metrics:
+                                    text_color = "green" if metric["condition"] else "red"
+                                    status_text = metric["buy_text"] if metric["condition"] else metric["sell_text"]
+                                    st.write(f"**{metric['name']}:** {metric['value']} - <span style='color:{text_color}'>{status_text}</span>", unsafe_allow_html=True)
+            else:
+                st.warning("⚠️ No valid signals generated. Check if stock data is available.")
