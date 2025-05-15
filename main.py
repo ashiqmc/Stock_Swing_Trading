@@ -30,7 +30,7 @@ st.sidebar.header("⚙️ Settings")
 # Default stocks list
 # default_stocks = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS","BLUESTARCO.BO","UJJIVANSFB.NS","TATAMOTORS.NS", "SUZLON.NS"]
 # Default stocks list
-default_stocks = ["BLUESTARCO.BO", "SUZLON.NS","UJJIVANSFB.NS","TATAMOTORS.NS"]
+default_stocks = ["BLUESTARCO.BO", "SUZLON.NS","UJJIVANSFB.NS","TATAMOTORS.NS","TATASTEEL.NS"]
 # Initialize session state for tracking selected stocks
 if 'selected_stocks' not in st.session_state:
     st.session_state.selected_stocks = default_stocks.copy()
