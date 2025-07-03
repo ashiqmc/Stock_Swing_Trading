@@ -1,0 +1,24 @@
+# Core App Framework
+streamlit>=1.35.0
+
+# Data Manipulation & Analysis
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Stock Data
+yfinance>=0.2.36
+
+# Visualization
+plotly>=5.20.0
+matplotlib>=3.8.0
+
+# Technical Analysis
+ta>=0.11.0               # Technical Analysis library
+pandas-ta>=0.3.14b0      # Alternate TA library
+
+# Caching & Utils
+requests>=2.31.0
+tqdm>=4.66.0
+
+# For rich terminal outputs/logs (optional but helpful)
+rich>=13.7.0
